@@ -61,7 +61,7 @@ namespace {
     constexpr double EDGE       = 6.0;  // window boxes grown by this to take borders along, logical px
     constexpr double WIN_CORNER = 10.0; // window corner radius, logical px
     // timing (s)
-    constexpr float T_CLOSE = 0.90f;
+    constexpr float T_CLOSE = 0.70f;
     constexpr float T_OPEN  = 0.70f;
     constexpr float T_MOVE  = 0.45f;
     constexpr float T_WS_CLOSE = 0.70f; // workspace switch: old windows collapse
@@ -207,6 +207,8 @@ uniform vec2  vel;
 uniform float time;
 uniform float px;            // 1 logical px
 uniform vec2  fbSize;
+uniform int   occN;          // windows in front of this effect (a closing window lies behind the others)
+uniform vec4  occ[16];
 out vec4 frag;
 
 float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
@@ -308,6 +310,15 @@ vec2 ripple(vec2 p, float shift) {
 
 void main() {
     vec2  p0 = gl_FragCoord.xy;
+    for (int i = 0; i < 16; i++) {
+        if (i >= occN)
+            break;
+        vec4 o = occ[i];
+        if (p0.x >= o.x && p0.y >= o.y && p0.x < o.x + o.z && p0.y < o.y + o.w) {
+            frag = texture(scene, p0 / fbSize); // that window is in front: leave it as it is
+            return;
+        }
+    }
     vec2  d  = p0 - c;
     float r  = length(d);
     float fade = 1.0 - smoothstep(reach * 0.85, reach, r);
@@ -339,7 +350,7 @@ void main() {
     struct SGL {
         GLuint prog = 0, vao = 0;
         GLint  uScene = -1, uContent = -1, uContentUv = -1, uWin = -1, uCorner = -1, uC = -1, uS = -1, uRh = -1, uE = -1, uTwist = -1, uDisk = -1, uFlashR = -1,
-              uFlashA = -1, uRotA = -1, uHeat = -1, uShed = -1, uSGhost = -1, uTwistGhost = -1, uWinAlpha = -1, uSpin = -1, uReach = -1, uVel = -1, uTime = -1, uPx = -1, uFb = -1;
+              uFlashA = -1, uOccN = -1, uOcc = -1, uRotA = -1, uHeat = -1, uShed = -1, uSGhost = -1, uTwistGhost = -1, uWinAlpha = -1, uSpin = -1, uReach = -1, uVel = -1, uTime = -1, uPx = -1, uFb = -1;
         bool failed = false;
     } g_gl;
 
@@ -408,6 +419,8 @@ void main() {
         g_gl.uFlashR    = U("flashR");
         g_gl.uFlashA    = U("flashA");
         g_gl.uRotA      = U("rotA");
+        g_gl.uOccN      = U("occN");
+        g_gl.uOcc       = U("occ[0]");
         g_gl.uHeat      = U("heat");
         g_gl.uShed      = U("shed");
         g_gl.uSGhost    = U("sGhost");
@@ -802,7 +815,7 @@ void main() {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     }
 
-    void drawFx(SMonitorState& st, SEffect& f, const SP<Render::IFramebuffer>& target, bool refreshScene) {
+    void drawFx(SMonitorState& st, SEffect& f, const SP<Render::IFramebuffer>& target, const PHLMONITOR& mon) {
         const auto& CONTENT = f.snap ? f.snap : st.last;
         if (!CONTENT)
             return;
@@ -814,8 +827,29 @@ void main() {
             reach = std::max(reach, len(V2{(float)(p.win.x + p.win.w * K.x), (float)(p.win.y + p.win.h * K.y)} - p.c));
         reach = std::max({reach * 1.15f + 40.f * st.scale, p.rh * 9.f, p.E * 4.f, p.flashR + 60.f * st.scale});
 
-        if (refreshScene && st.scene) // effects stack: each sees the ones drawn before it
-            blitAll(target, st.scene);
+        const int X0 = std::clamp((int)std::floor(p.c.x - reach), 0, (int)FW), X1 = std::clamp((int)std::ceil(p.c.x + reach), 0, (int)FW);
+        const int Y0 = std::clamp((int)std::floor(p.c.y - reach), 0, (int)FH), Y1 = std::clamp((int)std::ceil(p.c.y + reach), 0, (int)FH);
+        if (X1 <= X0 || Y1 <= Y0)
+            return;
+        // effects stack: each sees the ones drawn before it (only its own region is copied)
+        blitRect(target, st.scene, X0, Y0, X1, Y1, X0, Y0);
+        glBindFramebuffer(GL_FRAMEBUFFER, *fbID(target));
+
+        // a closing window lies behind the others: windows (where they are drawn
+        // now) cover its hole as they move into its place
+        std::vector<float> occ;
+        if (f.kind == CLOSE)
+            for (const auto& w : st.cached) {
+                if (occ.size() >= 16 * 4)
+                    break;
+                CBox B = glBox(w.box, mon);
+                if (const auto* o = findFx(st, w.id)) {
+                    if (o->kind == DRAG || (o->kind == OPEN && o->p.s < 0.6f))
+                        continue;
+                    B = o->p.win;
+                }
+                occ.insert(occ.end(), {(float)B.x, (float)B.y, (float)B.w, (float)B.h});
+            }
         glActiveTexture(GL_TEXTURE0);
         linearClamp(st.scene);
         glActiveTexture(GL_TEXTURE1);
@@ -851,10 +885,9 @@ void main() {
         glUniform1f(g_gl.uPx, st.scale);
         glUniform2f(g_gl.uFb, FW, FH);
 
-        const int X0 = std::clamp((int)std::floor(p.c.x - reach), 0, (int)FW), X1 = std::clamp((int)std::ceil(p.c.x + reach), 0, (int)FW);
-        const int Y0 = std::clamp((int)std::floor(p.c.y - reach), 0, (int)FH), Y1 = std::clamp((int)std::ceil(p.c.y + reach), 0, (int)FH);
-        if (X1 <= X0 || Y1 <= Y0)
-            return;
+        glUniform1i(g_gl.uOccN, (GLint)(occ.size() / 4));
+        if (!occ.empty())
+            glUniform4fv(g_gl.uOcc, (GLsizei)(occ.size() / 4), occ.data());
         glEnable(GL_SCISSOR_TEST);
         glScissor(X0, Y0, X1 - X0, Y1 - Y0);
         glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -1007,7 +1040,7 @@ void main() {
                 for (auto& f : st.fx) {
                     const int P = f->kind == CLOSE ? 0 : f->kind == DRAG ? 2 : 1;
                     if (P == pass)
-                        drawFx(st, *f, CUR, true);
+                        drawFx(st, *f, CUR, MON);
                 }
             gs.restore();
             return {};
