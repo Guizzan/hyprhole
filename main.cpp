@@ -4,9 +4,11 @@
 // shrinks faster and faster (spinning up as it contracts, heating to a
 // blue-white glow), space around it bends more and more as it gets denser,
 // its outer layers peel off into spiral streams, and when it is small enough
-// an event horizon forms in a flash and a gravitational-wave ripple: the
-// window has become a black hole, with an accretion disk made from what it
-// shed. Then the hole evaporates.
+// an event horizon forms with a gravitational-wave ripple: the window has
+// become a black hole. Nothing is drawn for the hole: it shows only through
+// what it does to space - the desktop around it folds into a mirrored
+// Einstein ring with rainbow edges and is wound into a whirlpool by the
+// spinning mass. Then the hole evaporates and space relaxes.
 //
 //   * opening: the same played backwards: a black hole explodes into a window;
 //   * moving / resizing / fullscreen / layout changes: the window's mass bends
@@ -19,9 +21,8 @@
 // Optics: background light is bent by the point-mass lens equation
 // (beta = theta - thetaE^2 / theta), giving the Einstein ring and the mirrored
 // image around the horizon; red, green and blue use slightly different
-// Einstein radii (chromatic fringing); the disk is a thin tilted ring with
-// Keplerian shear, Doppler beaming and its far side lensed up over the hole;
-// a photon ring hugs the horizon.
+// Einstein radii (chromatic fringing); frame dragging twists it; ripples
+// displace each colour slightly differently.
 //
 // Rendering: every frame the damaged part of the composited windows is kept
 // in `last` and of the background (before windows) in `bg`. While effects
@@ -277,83 +278,58 @@ vec4 windowShed(vec2 q) {
         r0 = r1 / pow(ss, 1.0 + 2.5 * L * 0.2 / (r0 + L * 0.2));
     float sd;
     vec4 w = sampleWin(c + vec2(cos(th), sin(th)) * r0, r1, 1.0, sd);
-    // only the streams outside the core, fading
-    w.rgb = mix(w.rgb, blackbody(0.35), 0.35);
     return w;
 }
 
-// the bent position of the light arriving at screen point p, for Einstein radius e
+// The bent position of the light arriving at screen point p, for Einstein
+// radius e. Nothing is drawn for the hole itself: it only shows in what it
+// does to space - the desktop folds into a mirrored Einstein ring around it
+// and is wound into a whirlpool by the spinning mass (frame dragging).
 vec2 lens(vec2 p, float e) {
     vec2  d = p - c;
     float r = max(length(d), 1e-3);
     float fall = 1.0 - smoothstep(reach * 0.55, reach, r);
     float b = r - e * e / r * fall;
-    // frame dragging drags the background round too, close to the hole
-    vec2 dir = rot(d / r, rh > 0.0 ? spin * 1.2 * rh * rh / (r * r + rh * rh) : 0.0);
+    float R = max(max(rh, e * 0.45), 1.0);
+    vec2 dir = rot(d / r, spin * twist * R * R / (r * r + R * R) * fall);
     return c + dir * b;
 }
 
-void main() {
-    vec2  p = gl_FragCoord.xy;
+// a gravitational wave passing: space is pushed in and out, each colour by
+// slightly different amounts (a chromatic ripple, no light of its own)
+vec2 ripple(vec2 p, float shift) {
     vec2  d = p - c;
     float r = length(d);
-    float fade = 1.0 - smoothstep(reach * 0.85, reach, r);
+    if (flashA <= 0.0 || r < 1e-3)
+        return p;
+    float k = (r - flashR) / (16.0 * px) + shift;
+    return p + d / r * flashA * 11.0 * px * sin(k * 2.2) * exp(-k * k * 0.15);
+}
 
-    // a gravitational wave: space ripples outward
-    float k = (r - flashR) / (16.0 * px);
-    if (flashA > 0.0 && r > 1e-3)
-        p += d / r * flashA * 9.0 * px * sin(k * 2.2) * exp(-k * k * 0.18);
+void main() {
+    vec2  p0 = gl_FragCoord.xy;
+    vec2  d  = p0 - c;
+    float r  = length(d);
+    float fade = 1.0 - smoothstep(reach * 0.85, reach, r);
+    vec2  pr = ripple(p0, -0.35), pg = ripple(p0, 0.0), pb = ripple(p0, 0.35);
 
     // space behind, bent by the window's mass, each colour a little differently
-    vec3 col = vec3(texture(scene, lens(p, E * 1.04) / fbSize).r, texture(scene, lens(p, E) / fbSize).g, texture(scene, lens(p, E * 0.96) / fbSize).b);
+    vec3 col = vec3(texture(scene, lens(pr, E * 1.05) / fbSize).r, texture(scene, lens(pg, E) / fbSize).g, texture(scene, lens(pb, E * 0.95) / fbSize).b);
 
     // the shed layers, then the window itself (colour fringes along its motion)
     if (shed > 0.001) {
-        vec4 g = windowShed(p);
+        vec4 g = windowShed(pg);
         col = mix(col, g.rgb, g.a * shed * 0.55);
     }
-    vec2  f = vel * 0.012 + (p - c) * 0.012 * heat; // + a little dispersion as it heats
+    vec2  f = vel * 0.012 + (pg - c) * 0.012 * heat; // + a little dispersion as it heats
     float gr, gg, gb;
-    vec4  wr = windowCore(p - f, gr), wg = windowCore(p, gg), wb = windowCore(p + f, gb);
+    vec4  wr = windowCore(pr - f, gr), wg = windowCore(pg, gg), wb = windowCore(pb + f, gb);
     col = vec3(mix(col.r, wr.r, wr.a), mix(col.g, wg.g, wg.a), mix(col.b, wb.b, wb.a));
-    col += vec3(gr * 0.75, gg * 0.85, gb * 1.0) * vec3(0.75, 0.85, 1.0) * winAlpha;
+    col += vec3(gr * 0.6, gg * 0.7, gb * 0.85) * vec3(0.75, 0.85, 1.0) * winAlpha * 0.7;
 
-    if (rh > 0.0) {
-        float rr = r / rh;
-        // the event horizon
-        float hz = 1.0 - smoothstep(0.97, 1.0, rr);
-        col = mix(col, vec3(0.0), hz);
-
-        // accretion disk: a thin tilted ring (front side crosses the hole),
-        // its far side lensed up over the top as a halo
-        vec2  dp  = vec2(d.x, d.y / 0.23) / rh;
-        float rd  = length(dp);
-        float ad  = atan(dp.y, dp.x) + spin * time * 2.4 / pow(max(rd, 1.0), 1.5);
-        float bands = 0.35 + 0.9 * fbm(vec2(cos(ad), sin(ad)) * rd * 1.6 + vec2(rd * 2.0, 0.0));
-        float dopp  = 1.0 + 0.75 * spin * (-dp.x / max(rd, 1e-3));
-        float kk    = clamp((rd - 1.5) / 3.3, 0.0, 1.0);
-        vec3  feed  = texture(content, contentUv.xy + vec2(fract(ad / 6.2831853), kk) * contentUv.zw).rgb;
-        vec3  dcol  = mix(blackbody(kk), feed * 1.7 + 0.15, 0.40);
-        float front = smoothstep(1.45, 1.9, rd) * (1.0 - smoothstep(3.4, 4.8, rd));
-        float hidden = (d.y < 0.0 && rr < 1.0) ? 0.0 : 1.0;
-        col += dcol * front * bands * dopp * 1.5 * disk * hidden;
-
-        float ah   = atan(d.y, d.x) + spin * time * 1.6;
-        float hb   = 0.35 + 0.9 * fbm(vec2(cos(ah), sin(ah)) * 2.4 + rr * 3.0);
-        float halo = smoothstep(1.02, 1.18, rr) * (1.0 - smoothstep(1.35, 2.2, rr));
-        float top  = 0.55 + 0.9 * max(-d.y / max(r, 1e-3), 0.0);
-        col += blackbody(0.25 + 0.4 * (rr - 1.0)) * halo * hb * top * 1.3 * disk;
-        col += vec3(1.0, 0.92, 0.82) * exp(-pow((rr - 1.045) / 0.022, 2.0)) * 1.6 * disk;
-    }
-
-    // the flash of the ripple, split into colours
-    if (flashA > 0.0) {
-        float w = 6.0 * px;
-        col += vec3(exp(-pow((r - flashR - 2.0 * px) / w, 2.0)), exp(-pow((r - flashR) / w, 2.0)), exp(-pow((r - flashR + 2.0 * px) / w, 2.0)))
-             * vec3(1.0, 0.9, 0.95) * flashA * 0.8;
-        // and the core's flash as the horizon forms
-        col += vec3(0.85, 0.9, 1.0) * flashA * flashA * exp(-r / (max(rh, 4.0 * px) * 2.5)) * 1.2;
-    }
+    // the shadow: no drawn disk, just light failing to get out near the centre
+    if (rh > 0.0)
+        col *= smoothstep(rh * 0.35, rh * 1.1, r);
 
     vec3 base = texture(scene, gl_FragCoord.xy / fbSize).rgb;
     frag = vec4(mix(base, col, fade), 1.0);
@@ -556,7 +532,7 @@ void main() {
         // the lensing grows as the mass gets compact, then is the hole's
         p.E       = t < tc ? EINSTEIN * rhPeak * std::pow(smooth01((K - 0.05f) / 0.95f), 1.5f) : EINSTEIN * p.rh;
         p.alpha   = 1.f - smooth01((t - tc) / 0.05f); // the core is gone behind its horizon
-        p.disk    = smooth01((t - tc * 0.75f) / 0.2f) * LEFT;
+        p.twist   = 3.2f * (t < tc ? K * K : LEFT); // the desktop is wound into a whirlpool
         if (t >= tc && t < tc + 0.35f) {
             const float F = (t - tc) / 0.35f;
             p.flashR      = F * MAXD * 1.1f;
@@ -829,7 +805,7 @@ void main() {
         float reach = 0.f;
         for (const V2 K : {V2{0, 0}, V2{1, 0}, V2{0, 1}, V2{1, 1}})
             reach = std::max(reach, len(V2{(float)(p.win.x + p.win.w * K.x), (float)(p.win.y + p.win.h * K.y)} - p.c));
-        reach = std::max({reach * 1.15f + 40.f * st.scale, p.rh * 6.f, p.E * 4.f, p.flashR + 60.f * st.scale});
+        reach = std::max({reach * 1.15f + 40.f * st.scale, p.rh * 9.f, p.E * 4.f, p.flashR + 60.f * st.scale});
 
         if (refreshScene && st.scene) // effects stack: each sees the ones drawn before it
             blitAll(target, st.scene);
