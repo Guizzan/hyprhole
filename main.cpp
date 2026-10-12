@@ -1,18 +1,20 @@
-// hyprhole — every window change goes through a black hole.
+// hyprhole — windows that collapse into black holes.
 //
-//   * closing: a black hole forms in the window, the window spirals into it
-//     (frame dragging), stretched into streams (tidal forces), its colours
-//     feed a glowing accretion disk, then the hole evaporates in a flash and
-//     a gravitational-wave ripple;
-//   * opening: a hole spits the window out, unwinding, then closes;
-//   * moving / resizing / fullscreen / layout changes: the window carries
-//     mass: it bends the light around it as it travels (with a twist and
-//     colour fringes), and sends a ripple through space;
-//   * workspace switch: a black hole opens in the middle of the screen and
-//     swallows the old desktop, revealing the new one through its lensing;
+// A window is a mass. Close it and it collapses under its own gravity: it
+// shrinks faster and faster (spinning up as it contracts, heating to a
+// blue-white glow), space around it bends more and more as it gets denser,
+// its outer layers peel off into spiral streams, and when it is small enough
+// an event horizon forms in a flash and a gravitational-wave ripple: the
+// window has become a black hole, with an accretion disk made from what it
+// shed. Then the hole evaporates.
+//
+//   * opening: the same played backwards: a black hole explodes into a window;
+//   * moving / resizing / fullscreen / layout changes: the window's mass bends
+//     the light around it as it travels, with colour fringes and a ripple;
+//   * workspace switch: every window of the old desktop collapses into its own
+//     black hole drifting away, the new desktop's windows burst out of theirs;
 //   * dragging (SUPER + mouse): the window collapses into a small black hole
-//     that follows the cursor, wrapped in an accretion disk made from the
-//     window; dropping it lets the window burst back out in its new place.
+//     that follows the cursor; dropping it makes it burst back out.
 //
 // Optics: background light is bent by the point-mass lens equation
 // (beta = theta - thetaE^2 / theta), giving the Einstein ring and the mirrored
@@ -25,8 +27,8 @@
 // in `last` and of the background (before windows) in `bg`. While effects
 // run, the real windows under them are painted over with the background and
 // each effect is drawn from `last` (live content) or a snapshot (closing
-// windows, the dragged window, the old desktop). Hyprland's own window and
-// workspace animations must be disabled.
+// windows, the dragged window). Hyprland's own window and workspace
+// animations must be disabled.
 
 #include <hyprland/src/plugins/PluginAPI.hpp>
 #include <hyprland/src/event/EventBus.hpp>
@@ -58,10 +60,12 @@ namespace {
     constexpr double EDGE       = 6.0;  // window boxes grown by this to take borders along, logical px
     constexpr double WIN_CORNER = 10.0; // window corner radius, logical px
     // timing (s)
-    constexpr float T_CLOSE = 0.80f;
+    constexpr float T_CLOSE = 0.90f;
     constexpr float T_OPEN  = 0.70f;
     constexpr float T_MOVE  = 0.45f;
-    constexpr float T_WS    = 0.90f;
+    constexpr float T_WS_CLOSE = 0.70f; // workspace switch: old windows collapse
+    constexpr float T_WS_OPEN  = 0.62f; //                   new windows burst out
+    constexpr float COLLAPSE   = 0.55f; // share of a close before the horizon forms
     constexpr float T_PICK  = 0.40f; // drag: window -> hole
     constexpr float T_DROP  = 0.60f; // drag: hole -> window
     // holes
@@ -108,7 +112,6 @@ namespace {
         CLOSE,
         OPEN,
         MOVE,
-        WORKSPACE,
         DRAG
     };
 
@@ -122,7 +125,10 @@ namespace {
         float twist  = 0.f;    // frame dragging
         float disk   = 0.f;    // accretion disk brightness
         float flashR = 0.f, flashA = 0.f; // gravitational-wave ring
-        float lensWin = 1.f;   // the window itself is lensed (it is falling in), or only the space around it
+        float rotA   = 0.f;    // spin of the collapsing window
+        float heat   = 0.f;    // blue-white glow of the compressed window
+        float shed   = 0.f;    // outer layers peeling off into streams
+        float sGhost = 1.f, twistGhost = 0.f;
         float corner  = 0.f;
         float alpha   = 1.f;   // the window's opacity
         V2    vel;             // px per second (colour fringes along the motion)
@@ -140,6 +146,7 @@ namespace {
         CBox                     from, to;         // GL px
         Clock::time_point        start, lastStep;
         float                    dur = 0.5f, spin = 1.f, rhPeak = 30.f;
+        V2                       drift; // workspace switch: where the hole drifts (px)
         V2                       hole, holeV, grabOff; // drag: hole position, velocity; window rect offset from it
         V2                       prevC;
         SParams                  p;
@@ -187,7 +194,11 @@ uniform float twist;
 uniform float disk;
 uniform float flashR;
 uniform float flashA;
-uniform float lensWin;
+uniform float rotA;
+uniform float heat;
+uniform float shed;
+uniform float sGhost;
+uniform float twistGhost;
 uniform float winAlpha;
 uniform float spin;          // +1 / -1: which way it turns
 uniform float reach;         // beyond this the effect fades out (px)
@@ -221,31 +232,54 @@ vec3 blackbody(float k) {
 
 float L0() { return max(max(winBox.z, winBox.w) * 0.35, 1.0); }
 
-// Where a point that is now at screen `q` was on the window before it fell:
-// undo the frame-dragging swirl and the infall (inner parts fall faster,
-// which tears the window into spiral streams).
-vec4 windowAt(vec2 q) {
-    vec2  rel = q - c;
-    float r1  = length(rel);
-    float L   = L0();
-    float th  = atan(rel.y, rel.x) - spin * twist / (r1 / L + 0.25);
-    float ss  = max(s, 1e-3);
-    float r0  = r1 / ss;
-    for (int i = 0; i < 3; i++)
-        r0 = r1 / pow(ss, 1.0 + 2.5 * L * 0.2 / (r0 + L * 0.2));
-    vec2 src = c + vec2(cos(th), sin(th)) * r0;
-    vec2 uv  = (src - winBox.xy) / winBox.zw;
-    float m  = 1.0 - smoothstep(-1.0, 1.0, sdRound(src - winBox.xy - winBox.zw * 0.5, winBox.zw * 0.5, corner));
-    if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0)
+vec4 sampleWin(vec2 src, float r1, float rimPx, out float sdOut) {
+    vec2  uv = (src - winBox.xy) / winBox.zw;
+    float sd = sdRound(src - winBox.xy - winBox.zw * 0.5, winBox.zw * 0.5, corner);
+    sdOut    = sd;
+    float m  = 1.0 - smoothstep(-rimPx, rimPx, sd);
+    if (uv.x < -0.01 || uv.y < -0.01 || uv.x > 1.01 || uv.y > 1.01)
         m = 0.0;
     vec3 col = texture(content, contentUv.xy + clamp(uv, 0.0, 1.0) * contentUv.zw).rgb;
-    // light climbing out near the hole is redshifted and dimmed
     if (rh > 0.0) {
+        // light climbing out near the horizon is redshifted and dimmed
         float g = smoothstep(rh, rh * 3.0, r1);
         col = mix(col * vec3(1.0, 0.35, 0.18) * 0.6, col, g);
         m *= smoothstep(rh * 0.98, rh * 1.25, r1);
     }
-    return vec4(col, m * winAlpha);
+    return vec4(col, m);
+}
+
+// The collapsing window itself: shrunk about the centre by `s`, spun by rotA,
+// glowing as it heats. `glow` returns the light it radiates around itself.
+vec4 windowCore(vec2 q, out float glow) {
+    vec2  rel = rot(q - c, -spin * rotA);
+    float ss  = max(s, 1e-3);
+    vec2  src = c + rel / ss;
+    float sd;
+    vec4  w = sampleWin(src, length(q - c), 0.8 / ss, sd);
+    float screenSd = sd * ss;
+    glow = heat * exp(-max(screenSd, 0.0) / (14.0 * px)) * step(0.0, screenSd);
+    w.rgb = mix(w.rgb, vec3(0.80, 0.88, 1.0) * 1.5, heat * 0.8);
+    w.a  *= winAlpha;
+    return w;
+}
+
+// Its outer layers, peeling off: they lag behind the core and are wound into
+// spiral streams (inner parts orbit faster).
+vec4 windowShed(vec2 q) {
+    vec2  rel = q - c;
+    float r1  = length(rel);
+    float L   = L0();
+    float th  = atan(rel.y, rel.x) - spin * twistGhost / (r1 / L + 0.25);
+    float ss  = max(sGhost, 1e-3);
+    float r0  = r1 / ss;
+    for (int i = 0; i < 3; i++)
+        r0 = r1 / pow(ss, 1.0 + 2.5 * L * 0.2 / (r0 + L * 0.2));
+    float sd;
+    vec4 w = sampleWin(c + vec2(cos(th), sin(th)) * r0, r1, 1.0, sd);
+    // only the streams outside the core, fading
+    w.rgb = mix(w.rgb, blackbody(0.35), 0.35);
+    return w;
 }
 
 // the bent position of the light arriving at screen point p, for Einstein radius e
@@ -255,7 +289,7 @@ vec2 lens(vec2 p, float e) {
     float fall = 1.0 - smoothstep(reach * 0.55, reach, r);
     float b = r - e * e / r * fall;
     // frame dragging drags the background round too, close to the hole
-    vec2 dir = rot(d / r, spin * twist * 0.35 * rh * rh / (r * r + rh * rh) * 4.0);
+    vec2 dir = rot(d / r, rh > 0.0 ? spin * 1.2 * rh * rh / (r * r + rh * rh) : 0.0);
     return c + dir * b;
 }
 
@@ -265,29 +299,24 @@ void main() {
     float r = length(d);
     float fade = 1.0 - smoothstep(reach * 0.85, reach, r);
 
-    // a gravitational wave: space ripples outward from the hole
+    // a gravitational wave: space ripples outward
     float k = (r - flashR) / (16.0 * px);
     if (flashA > 0.0 && r > 1e-3)
         p += d / r * flashA * 9.0 * px * sin(k * 2.2) * exp(-k * k * 0.18);
 
-    // background, lensed, each colour bent a little differently
-    vec3 col;
-    vec4 w;
-    if (lensWin > 0.5) {
-        vec4 wr = windowAt(lens(p, E * 1.035));
-        vec4 wg = windowAt(lens(p, E));
-        vec4 wb = windowAt(lens(p, E * 0.965));
-        col.r = mix(texture(scene, lens(p, E * 1.035) / fbSize).r, wr.r, wr.a);
-        col.g = mix(texture(scene, lens(p, E) / fbSize).g, wg.g, wg.a);
-        col.b = mix(texture(scene, lens(p, E * 0.965) / fbSize).b, wb.b, wb.a);
-    } else {
-        // a moving mass: space around it bends, the window keeps its shape but
-        // twists a little and fringes along its motion
-        col = vec3(texture(scene, lens(p, E * 1.06) / fbSize).r, texture(scene, lens(p, E) / fbSize).g, texture(scene, lens(p, E * 0.94) / fbSize).b);
-        vec2 f = vel * 0.012;
-        vec4 wr = windowAt(p - f), wg = windowAt(p), wb = windowAt(p + f);
-        col = vec3(mix(col.r, wr.r, wr.a), mix(col.g, wg.g, wg.a), mix(col.b, wb.b, wb.a));
+    // space behind, bent by the window's mass, each colour a little differently
+    vec3 col = vec3(texture(scene, lens(p, E * 1.04) / fbSize).r, texture(scene, lens(p, E) / fbSize).g, texture(scene, lens(p, E * 0.96) / fbSize).b);
+
+    // the shed layers, then the window itself (colour fringes along its motion)
+    if (shed > 0.001) {
+        vec4 g = windowShed(p);
+        col = mix(col, g.rgb, g.a * shed * 0.55);
     }
+    vec2  f = vel * 0.012 + (p - c) * 0.012 * heat; // + a little dispersion as it heats
+    float gr, gg, gb;
+    vec4  wr = windowCore(p - f, gr), wg = windowCore(p, gg), wb = windowCore(p + f, gb);
+    col = vec3(mix(col.r, wr.r, wr.a), mix(col.g, wg.g, wg.a), mix(col.b, wb.b, wb.a));
+    col += vec3(gr * 0.75, gg * 0.85, gb * 1.0) * vec3(0.75, 0.85, 1.0) * winAlpha;
 
     if (rh > 0.0) {
         float rr = r / rh;
@@ -306,15 +335,14 @@ void main() {
         vec3  feed  = texture(content, contentUv.xy + vec2(fract(ad / 6.2831853), kk) * contentUv.zw).rgb;
         vec3  dcol  = mix(blackbody(kk), feed * 1.7 + 0.15, 0.40);
         float front = smoothstep(1.45, 1.9, rd) * (1.0 - smoothstep(3.4, 4.8, rd));
-        float hidden = (d.y < 0.0 && rr < 1.0) ? 0.0 : 1.0; // behind the hole on the far side
+        float hidden = (d.y < 0.0 && rr < 1.0) ? 0.0 : 1.0;
         col += dcol * front * bands * dopp * 1.5 * disk * hidden;
 
         float ah   = atan(d.y, d.x) + spin * time * 1.6;
         float hb   = 0.35 + 0.9 * fbm(vec2(cos(ah), sin(ah)) * 2.4 + rr * 3.0);
         float halo = smoothstep(1.02, 1.18, rr) * (1.0 - smoothstep(1.35, 2.2, rr));
-        float top  = 0.55 + 0.9 * max(-d.y / max(r, 1e-3), 0.0); // rows run top-down: the arc over the top
+        float top  = 0.55 + 0.9 * max(-d.y / max(r, 1e-3), 0.0);
         col += blackbody(0.25 + 0.4 * (rr - 1.0)) * halo * hb * top * 1.3 * disk;
-        // photon ring
         col += vec3(1.0, 0.92, 0.82) * exp(-pow((rr - 1.045) / 0.022, 2.0)) * 1.6 * disk;
     }
 
@@ -323,6 +351,8 @@ void main() {
         float w = 6.0 * px;
         col += vec3(exp(-pow((r - flashR - 2.0 * px) / w, 2.0)), exp(-pow((r - flashR) / w, 2.0)), exp(-pow((r - flashR + 2.0 * px) / w, 2.0)))
              * vec3(1.0, 0.9, 0.95) * flashA * 0.8;
+        // and the core's flash as the horizon forms
+        col += vec3(0.85, 0.9, 1.0) * flashA * flashA * exp(-r / (max(rh, 4.0 * px) * 2.5)) * 1.2;
     }
 
     vec3 base = texture(scene, gl_FragCoord.xy / fbSize).rgb;
@@ -333,7 +363,7 @@ void main() {
     struct SGL {
         GLuint prog = 0, vao = 0;
         GLint  uScene = -1, uContent = -1, uContentUv = -1, uWin = -1, uCorner = -1, uC = -1, uS = -1, uRh = -1, uE = -1, uTwist = -1, uDisk = -1, uFlashR = -1,
-              uFlashA = -1, uLensWin = -1, uWinAlpha = -1, uSpin = -1, uReach = -1, uVel = -1, uTime = -1, uPx = -1, uFb = -1;
+              uFlashA = -1, uRotA = -1, uHeat = -1, uShed = -1, uSGhost = -1, uTwistGhost = -1, uWinAlpha = -1, uSpin = -1, uReach = -1, uVel = -1, uTime = -1, uPx = -1, uFb = -1;
         bool failed = false;
     } g_gl;
 
@@ -401,7 +431,11 @@ void main() {
         g_gl.uDisk      = U("disk");
         g_gl.uFlashR    = U("flashR");
         g_gl.uFlashA    = U("flashA");
-        g_gl.uLensWin   = U("lensWin");
+        g_gl.uRotA      = U("rotA");
+        g_gl.uHeat      = U("heat");
+        g_gl.uShed      = U("shed");
+        g_gl.uSGhost    = U("sGhost");
+        g_gl.uTwistGhost = U("twistGhost");
         g_gl.uWinAlpha  = U("winAlpha");
         g_gl.uSpin      = U("spin");
         g_gl.uReach     = U("reach");
@@ -503,6 +537,33 @@ void main() {
         return nullptr;
     }
 
+    // A window collapsing into a black hole, at time t (s) of a collapse whose
+    // horizon forms at tc. `evaporate`: the hole fades away afterwards.
+    void collapse(SParams& p, const SMonitorState& st, float t, float tc, float rhPeak, bool evaporate) {
+        const float MIND = (float)std::min(p.win.w, p.win.h), MAXD = (float)std::max(p.win.w, p.win.h);
+        const float K    = std::clamp(t / tc, 0.f, 1.f);
+        const float SEND = std::clamp(rhPeak * 0.9f / std::max(MIND * 0.5f, 1.f), 0.02f, 0.6f);
+        p.s       = 1.f - (1.f - SEND) * std::pow(K, 2.2f); // gravity wins faster and faster
+        p.rotA    = std::min(0.12f * (1.f / p.s - 1.f), 4.f); // spins up as it contracts
+        p.heat    = smooth01((K - 0.3f) / 0.7f);
+        p.corner  = (float)(WIN_CORNER * st.scale) + (MIND * 0.5f - (float)(WIN_CORNER * st.scale)) * smooth01(std::pow(K, 1.3f));
+        p.shed    = smooth01((K - 0.25f) / 0.3f) * (1.f - smooth01((t - tc) / 0.25f));
+        p.sGhost  = std::pow(p.s, 0.55f);
+        p.twistGhost = 2.4f * K;
+        const float FORMED = smooth01((t - tc) / 0.06f);
+        const float LEFT   = evaporate ? 1.f - smooth01((t - (tc + 0.25f)) / 0.18f) : 1.f;
+        p.rh      = t < tc ? 0.f : rhPeak * FORMED * LEFT;
+        // the lensing grows as the mass gets compact, then is the hole's
+        p.E       = t < tc ? EINSTEIN * rhPeak * std::pow(smooth01((K - 0.05f) / 0.95f), 1.5f) : EINSTEIN * p.rh;
+        p.alpha   = 1.f - smooth01((t - tc) / 0.05f); // the core is gone behind its horizon
+        p.disk    = smooth01((t - tc * 0.75f) / 0.2f) * LEFT;
+        if (t >= tc && t < tc + 0.35f) {
+            const float F = (t - tc) / 0.35f;
+            p.flashR      = F * MAXD * 1.1f;
+            p.flashA      = 1.f - F;
+        }
+    }
+
     // Advance one effect; false once it has finished.
     bool step(SMonitorState& st, SEffect& f, const PHLMONITOR& mon) {
         const float T  = secsSince(f.start);
@@ -513,102 +574,63 @@ void main() {
         p              = {};
         p.corner       = (float)(WIN_CORNER * st.scale);
         const float S  = st.scale;
+        // a close is COLLAPSE of the run until the horizon, the rest the hole
+        const auto  RUN = [&](float tt) { return tt * (COLLAPSE + 0.45f) / 1.f; };
 
         switch (f.kind) {
             case CLOSE: {
-                p.win    = f.from;
-                p.c      = centreOf(f.from);
-                p.s      = 1.f - smooth01(t / 0.8f);
-                p.rh     = f.rhPeak * smooth01(t / 0.3f) * (1.f - smooth01((t - 0.74f) / 0.2f));
-                p.twist  = 2.6f * smooth01(t / 0.8f);
-                p.disk   = smooth01(t / 0.25f) * (1.f - smooth01((t - 0.66f) / 0.22f));
-                if (t > 0.76f) {
-                    const float K = (t - 0.76f) / 0.24f;
-                    p.flashR      = K * (float)std::max(f.from.w, f.from.h) * 0.9f;
-                    p.flashA      = 1.f - K;
-                }
+                const float DR = smooth01(t);
+                p.win = CBox{f.from.x + f.drift.x * DR, f.from.y + f.drift.y * DR, f.from.w, f.from.h};
+                p.c   = centreOf(p.win);
+                collapse(p, st, RUN(t), COLLAPSE, f.rhPeak, true);
                 break;
             }
             case OPEN: {
-                const float u = 1.f - t; // a close, played backwards
-                p.win    = f.to;
-                p.c      = centreOf(f.to);
-                p.s      = 1.f - smooth01(u / 0.8f);
-                p.rh     = f.rhPeak * smooth01(u / 0.3f) * (1.f - smooth01((u - 0.8f) / 0.2f));
-                p.twist  = 2.6f * smooth01(u / 0.8f);
-                p.disk   = smooth01(u / 0.25f) * (1.f - smooth01((u - 0.8f) / 0.2f));
-                if (t < 0.3f) {
-                    const float K = t / 0.3f;
-                    p.flashR      = K * (float)std::max(f.to.w, f.to.h) * 0.7f;
-                    p.flashA      = (1.f - K) * 0.8f;
-                }
+                // a close played backwards: a black hole explodes into the window
+                const float DR = 1.f - smooth01(t);
+                p.win = CBox{f.to.x + f.drift.x * DR, f.to.y + f.drift.y * DR, f.to.w, f.to.h};
+                p.c   = centreOf(p.win);
+                collapse(p, st, RUN(1.f - t), COLLAPSE, f.rhPeak, true);
                 break;
             }
             case MOVE: {
                 const float K = easeInOut(t);
-                p.win     = lerpBox(f.from, f.to, K);
-                p.c       = centreOf(p.win);
-                p.lensWin = 0.f;
+                p.win = lerpBox(f.from, f.to, K);
+                p.c   = centreOf(p.win);
                 const float B = std::sin(3.14159265f * t);
-                p.E       = 0.42f * (float)std::min(p.win.w, p.win.h) * 0.5f * B;
-                p.twist   = 0.06f * B;
-                p.flashR  = t * (float)std::max(p.win.w, p.win.h) * 1.1f;
-                p.flashA  = (1.f - t) * 0.55f;
+                p.E      = 0.42f * (float)std::min(p.win.w, p.win.h) * 0.5f * B;
+                p.flashR = t * (float)std::max(p.win.w, p.win.h) * 1.1f;
+                p.flashA = (1.f - t) * 0.55f;
                 const V2 C = p.c;
                 p.vel      = DT > 0.f ? (C - f.prevC) * (1.f / DT) : V2{};
                 f.prevC    = C;
                 break;
             }
-            case WORKSPACE: {
-                p.win     = f.from; // the old desktop, whole
-                p.corner  = 0.f;
-                p.c       = centreOf(f.from);
-                p.s       = 1.f - smooth01(t / 0.78f);
-                p.rh      = f.rhPeak * smooth01(t / 0.3f) * (1.f - smooth01((t - 0.72f) / 0.24f));
-                p.twist   = 3.2f * smooth01(t / 0.8f);
-                p.disk    = smooth01(t / 0.22f) * (1.f - smooth01((t - 0.62f) / 0.26f));
-                if (t > 0.74f) {
-                    const float K = (t - 0.74f) / 0.26f;
-                    p.flashR      = K * (float)std::max(f.from.w, f.from.h) * 0.75f;
-                    p.flashA      = 1.f - K;
-                }
-                break;
-            }
             case DRAG: {
-                const V2 CUR = cursorGL(mon);
+                const V2    CUR = cursorGL(mon);
+                const float RH  = (float)(DRAG_HOLE * S);
                 if (!f.released) {
                     // the hole follows the cursor on a spring (it has mass)
                     const V2 A = (CUR - f.hole) * 600.f - f.holeV * 38.f;
                     f.holeV    = f.holeV + A * DT;
                     f.hole     = f.hole + f.holeV * DT;
-                    const float K = std::clamp(T / T_PICK, 0.f, 1.f);
-                    p.c      = f.hole;
-                    p.win    = CBox{f.from.x + (CUR.x - f.grabOff.x), f.from.y + (CUR.y - f.grabOff.y), f.from.w, f.from.h};
-                    p.s      = 1.f - smooth01(K);
-                    p.rh     = (float)(DRAG_HOLE * S) * smooth01(K / 0.8f);
-                    p.twist  = 2.8f * smooth01(K);
-                    p.disk   = smooth01(K / 0.7f);
-                    p.vel    = f.holeV;
+                    p.c   = f.hole;
+                    p.win = CBox{f.from.x + (f.hole.x - f.grabOff.x), f.from.y + (f.hole.y - f.grabOff.y), f.from.w, f.from.h};
+                    collapse(p, st, std::min(T, T_PICK + 0.4f), T_PICK, RH, false);
+                    p.vel = f.holeV;
                 } else {
+                    // burst back out, flying into place
                     const float K = std::clamp(T / T_DROP, 0.f, 1.f);
                     const float M = easeInOut(std::min(1.f, K / 0.6f));
-                    p.c      = f.hole + (centreOf(f.to) - f.hole) * M;
-                    p.win    = CBox{p.c.x - f.to.w * 0.5, p.c.y - f.to.h * 0.5, f.to.w, f.to.h};
-                    p.s      = smooth01(K / 0.85f);
-                    p.rh     = (float)(DRAG_HOLE * S) * (1.f - smooth01(K / 0.7f));
-                    p.twist  = 2.8f * (1.f - smooth01(K / 0.85f));
-                    p.disk   = 1.f - smooth01(K / 0.6f);
-                    if (K < 0.35f) {
-                        p.flashR = K / 0.35f * (float)std::max(f.to.w, f.to.h) * 0.6f;
-                        p.flashA = (1.f - K / 0.35f) * 0.7f;
-                    }
+                    p.c   = f.hole + (centreOf(f.to) - f.hole) * M;
+                    p.win = CBox{p.c.x - f.to.w * 0.5, p.c.y - f.to.h * 0.5, f.to.w, f.to.h};
+                    collapse(p, st, (1.f - K) * (T_PICK + 0.2f), T_PICK, RH, false);
                     if (T >= T_DROP)
                         return false;
                 }
                 break;
             }
         }
-        p.E = p.rh > 0.f ? p.rh * EINSTEIN : p.E;
         return f.kind == DRAG || T < f.dur;
     }
 
@@ -703,16 +725,25 @@ void main() {
             return;
         }
         if (WS->m_id != st.cachedWs) {
-            // workspace switch: a black hole swallows the old desktop
+            // workspace switch: the old desktop's windows collapse into black
+            // holes drifting away, the new ones burst out of theirs
+            const float DIR = WS->m_id > st.cachedWs ? 1.f : -1.f;
+            const V2    DRIFT = {-DIR * (float)mon->m_pixelSize.x * 0.08f, 0.f};
             for (auto& f : st.fx)
                 if (f->kind != DRAG)
                     f->dead = true;
-            auto& f    = addFx(st, WORKSPACE, 0, T_WS);
-            f.from     = CBox{0, 0, (double)mon->m_pixelSize.x, (double)mon->m_pixelSize.y};
-            f.rhPeak   = (float)mon->m_pixelSize.y * 0.085f;
-            f.spin     = WS->m_id > st.cachedWs ? 1.f : -1.f;
-            f.needSnap = true;
-            f.snapBox  = f.from;
+            for (const auto& w : st.cached) {
+                addClose(st, mon, w);
+                st.fx.back()->dur   = T_WS_CLOSE;
+                st.fx.back()->drift = DRIFT;
+                st.fx.back()->spin  = DIR;
+            }
+            for (const auto& w : BOXES) {
+                addOpen(st, mon, w);
+                st.fx.back()->dur   = T_WS_OPEN;
+                st.fx.back()->drift = DRIFT * -1.f;
+                st.fx.back()->spin  = DIR;
+            }
             st.cachedWs = WS->m_id;
             st.cached   = BOXES;
             g_pHyprRenderer->damageMonitor(mon);
@@ -798,9 +829,7 @@ void main() {
         float reach = 0.f;
         for (const V2 K : {V2{0, 0}, V2{1, 0}, V2{0, 1}, V2{1, 1}})
             reach = std::max(reach, len(V2{(float)(p.win.x + p.win.w * K.x), (float)(p.win.y + p.win.h * K.y)} - p.c));
-        reach = std::max({reach * (p.lensWin > 0.5f ? 1.f : 1.15f) + 40.f * st.scale, p.rh * 6.f, p.E * 4.f, p.flashR + 60.f * st.scale});
-        if (f.kind == WORKSPACE)
-            reach = std::max(FW, FH) * 2.f;
+        reach = std::max({reach * 1.15f + 40.f * st.scale, p.rh * 6.f, p.E * 4.f, p.flashR + 60.f * st.scale});
 
         if (refreshScene && st.scene) // effects stack: each sees the ones drawn before it
             blitAll(target, st.scene);
@@ -826,7 +855,11 @@ void main() {
         glUniform1f(g_gl.uDisk, p.disk);
         glUniform1f(g_gl.uFlashR, p.flashR);
         glUniform1f(g_gl.uFlashA, p.flashA);
-        glUniform1f(g_gl.uLensWin, p.lensWin);
+        glUniform1f(g_gl.uRotA, p.rotA);
+        glUniform1f(g_gl.uHeat, p.heat);
+        glUniform1f(g_gl.uShed, p.shed);
+        glUniform1f(g_gl.uSGhost, p.sGhost);
+        glUniform1f(g_gl.uTwistGhost, p.twistGhost);
         glUniform1f(g_gl.uWinAlpha, p.alpha);
         glUniform1f(g_gl.uSpin, f.spin);
         glUniform1f(g_gl.uReach, reach);
@@ -989,7 +1022,7 @@ void main() {
             // the desktop first, then windows, the dragged one on top
             for (int pass = 0; pass < 3; ++pass)
                 for (auto& f : st.fx) {
-                    const int P = f->kind == WORKSPACE ? 0 : f->kind == DRAG ? 2 : 1;
+                    const int P = f->kind == CLOSE ? 0 : f->kind == DRAG ? 2 : 1;
                     if (P == pass)
                         drawFx(st, *f, CUR, true);
                 }
