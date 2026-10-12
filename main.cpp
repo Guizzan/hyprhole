@@ -148,6 +148,7 @@ namespace {
         Clock::time_point        start, lastStep;
         float                    dur = 0.5f, spin = 1.f, rhPeak = 30.f;
         V2                       drift; // workspace switch: where the hole drifts (px)
+        float                    delay = 0.f; // MOVE: wait (at the old place, old picture) for a close next to it
         V2                       hole, holeV, grabOff; // drag: hole position, velocity; window rect offset from it
         V2                       prevC;
         SParams                  p;
@@ -583,6 +584,13 @@ void main() {
                 break;
             }
             case MOVE: {
+                if (T < f.delay) { // a neighbour is still collapsing: wait in place
+                    p.win   = f.from;
+                    p.c     = centreOf(p.win);
+                    f.prevC = p.c;
+                    break;
+                }
+                const float t = std::clamp((T - f.delay) / f.dur, 0.f, 1.f);
                 const float K = easeInOut(t);
                 p.win = lerpBox(f.from, f.to, K);
                 p.c   = centreOf(p.win);
@@ -620,7 +628,7 @@ void main() {
                 break;
             }
         }
-        return f.kind == DRAG || T < f.dur;
+        return f.kind == DRAG || T < f.delay + f.dur;
     }
 
     // ---------------------------------------------------- window tracking ---
@@ -675,7 +683,7 @@ void main() {
         f.snapBox  = f.from;
     }
 
-    void addMove(SMonitorState& st, const PHLMONITOR& mon, const SWinBox& w, const CBox& fromL) {
+    void addMove(SMonitorState& st, const PHLMONITOR& mon, const SWinBox& w, const CBox& fromL, float delay) {
         const CBox TO = glBox(w.box, mon);
         if (auto* f = findFx(st, w.id)) {
             if (f->kind == DRAG)
@@ -703,6 +711,12 @@ void main() {
         f.to    = TO;
         f.live  = TO;
         f.prevC = centreOf(f.from);
+        if (delay > 0.f) {
+            // until the close beside it has played out it stays as it was
+            f.delay    = delay;
+            f.needSnap = true;
+            f.snapBox  = f.from;
+        }
     }
 
     // Before the windows are drawn: compare the windows with last frame's.
@@ -746,6 +760,11 @@ void main() {
             return;
         }
         bool changed = false;
+        // a window closing: the others wait until it has gone before filling its place
+        bool closing = false;
+        for (const auto& w : st.cached)
+            if (!findBox(BOXES, w.id) && !(DW && w.id == (uintptr_t)DW.get()))
+                closing = true;
         for (const auto& w : BOXES) {
             const auto OLD = findBox(st.cached, w.id);
             if (!OLD) {
@@ -754,7 +773,7 @@ void main() {
                 addOpen(st, mon, w);
                 changed = true;
             } else if (!sameBox(OLD->box, w.box)) {
-                addMove(st, mon, w, OLD->box);
+                addMove(st, mon, w, OLD->box, closing ? T_CLOSE * 0.92f : 0.f);
                 changed = true;
             }
         }
@@ -816,7 +835,8 @@ void main() {
     }
 
     void drawFx(SMonitorState& st, SEffect& f, const SP<Render::IFramebuffer>& target, const PHLMONITOR& mon) {
-        const auto& CONTENT = f.snap ? f.snap : st.last;
+        const bool  SNAP    = f.snap && !(f.kind == MOVE && secsSince(f.start) >= f.delay);
+        const auto& CONTENT = SNAP ? f.snap : st.last;
         if (!CONTENT)
             return;
         const float FW = (float)target->m_size.x, FH = (float)target->m_size.y;
@@ -858,7 +878,7 @@ void main() {
         glUseProgram(g_gl.prog);
         glUniform1i(g_gl.uScene, 0);
         glUniform1i(g_gl.uContent, 1);
-        if (f.snap)
+        if (SNAP)
             glUniform4f(g_gl.uContentUv, 0.f, 0.f, 1.f, 1.f);
         else
             glUniform4f(g_gl.uContentUv, (float)(f.live.x / FW), (float)(f.live.y / FH), (float)(f.live.w / FW), (float)(f.live.h / FH));
@@ -1025,7 +1045,7 @@ void main() {
 
             // the real windows under live effects give way to the background
             for (auto& f : st.fx)
-                if (!f->snap) {
+                if (f->kind == OPEN || f->kind == MOVE) {
                     const CBox& B  = f->live;
                     const int   X0 = std::max(0, (int)B.x), Y0 = std::max(0, (int)B.y);
                     const int   X1 = std::min((int)CUR->m_size.x, (int)(B.x + B.w)), Y1 = std::min((int)CUR->m_size.y, (int)(B.y + B.h));
