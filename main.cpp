@@ -667,6 +667,13 @@ void main() {
         if (auto* f = findFx(st, w.id)) {
             if (f->kind == DRAG)
                 return;
+            if (f->kind == OPEN) {
+                // a new window settling (layout, the app picking its size) in its
+                // first moments: keep bursting out, just into the new place
+                f->to   = TO;
+                f->live = TO;
+                return;
+            }
             // already travelling: carry on from where it is drawn now
             f->from  = f->kind == MOVE ? f->p.win : f->to;
             f->kind  = MOVE;
