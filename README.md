@@ -4,7 +4,7 @@ Windows that collapse into black holes. A Hyprland plugin where every window is 
 
 **Demo and details: https://guizzan.github.io/hyprhole/**
 
-https://github.com/Guizzan/hyprhole/raw/master/docs/demo.mp4
+[![hyprhole demo](docs/demo.gif)](https://guizzan.github.io/hyprhole/)
 
 ## What it does
 
