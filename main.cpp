@@ -591,7 +591,9 @@ void main() {
                     break;
                 }
                 const float t = std::clamp((T - f.delay) / f.dur, 0.f, 1.f);
-                const float K = easeInOut(t);
+                // after a close the neighbours pour into the space (fast start,
+                // long glide) while the hole evaporates beneath them
+                const float K = f.delay > 0.f ? 1.f - std::pow(1.f - t, 3.f) : easeInOut(t);
                 p.win = lerpBox(f.from, f.to, K);
                 p.c   = centreOf(p.win);
                 const float B = std::sin(3.14159265f * t);
@@ -712,8 +714,9 @@ void main() {
         f.live  = TO;
         f.prevC = centreOf(f.from);
         if (delay > 0.f) {
-            // until the close beside it has played out it stays as it was
+            // until the window beside it has collapsed it stays as it was
             f.delay    = delay;
+            f.dur      = T_MOVE * 1.25f;
             f.needSnap = true;
             f.snapBox  = f.from;
         }
@@ -773,7 +776,7 @@ void main() {
                 addOpen(st, mon, w);
                 changed = true;
             } else if (!sameBox(OLD->box, w.box)) {
-                addMove(st, mon, w, OLD->box, closing ? T_CLOSE * 0.92f : 0.f);
+                addMove(st, mon, w, OLD->box, closing ? T_CLOSE * COLLAPSE * 0.95f : 0.f);
                 changed = true;
             }
         }
