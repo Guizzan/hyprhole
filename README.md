@@ -40,4 +40,4 @@ Try it in a nested session first: `Hyprland -c test/hyprland.lua`.
 
 ## See also
 
-[hyprmorph](https://github.com/Guizzan/hyprmorph) (pixel morph) · [hyprliquid](https://github.com/Guizzan/hyprliquid) (liquid glass)
+[hyprmorph](https://github.com/Guizzan/hyprmorph) (pixel morph) · [hyprliquid](https://github.com/Guizzan/hyprliquid) (liquid)
