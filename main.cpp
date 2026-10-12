@@ -323,17 +323,17 @@ void main() {
     vec2  d  = p0 - c;
     float r  = length(d);
     float fade = 1.0 - smoothstep(reach * 0.85, reach, r);
-    vec2  pr = ripple(p0, -0.35), pg = ripple(p0, 0.0), pb = ripple(p0, 0.35);
+    vec2  pr = ripple(p0, -0.12), pg = ripple(p0, 0.0), pb = ripple(p0, 0.12);
 
     // space behind, bent by the window's mass, each colour a little differently
-    vec3 col = vec3(texture(scene, lens(pr, E * 1.05) / fbSize).r, texture(scene, lens(pg, E) / fbSize).g, texture(scene, lens(pb, E * 0.95) / fbSize).b);
+    vec3 col = vec3(texture(scene, lens(pr, E * 1.015) / fbSize).r, texture(scene, lens(pg, E) / fbSize).g, texture(scene, lens(pb, E * 0.985) / fbSize).b);
 
     // the shed layers, then the window itself (colour fringes along its motion)
     if (shed > 0.001) {
         vec4 g = windowShed(pg);
         col = mix(col, g.rgb, g.a * shed * 0.55);
     }
-    vec2  f = vel * 0.012 + (pg - c) * 0.012 * heat; // + a little dispersion as it heats
+    vec2  f = vel * 0.005 + (pg - c) * 0.005 * heat; // + a little dispersion as it heats
     float gr, gg, gb;
     vec4  wr = windowCore(pr - f, gr), wg = windowCore(pg, gg), wb = windowCore(pb + f, gb);
     col = vec3(mix(col.r, wr.r, wr.a), mix(col.g, wg.g, wg.a), mix(col.b, wb.b, wb.a));
